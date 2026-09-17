@@ -168,5 +168,9 @@ VD_CHROME="/path/to/chrome.exe" node devtest/run.mjs
 
 ## 许可
 
-`vendor/ffmpeg/` 内的 `@ffmpeg/ffmpeg` 与 `@ffmpeg/core` 来自 ffmpeg.wasm 项目，
-FFmpeg 本体为 LGPL/GPL，仅在本机离线使用。自用与再分发前请自行确认许可证要求。
+本项目自有代码采用 **MIT** 许可证，见 [`LICENSE`](LICENSE)。
+
+`vendor/ffmpeg/` 为第三方预构建产物，**不适用 MIT**：其中
+`@ffmpeg/ffmpeg`（MIT）与 `@ffmpeg/core`（**GPL-2.0-or-later**）来自
+[ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) 项目，版权归原作者所有。
+再分发前请阅读 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
