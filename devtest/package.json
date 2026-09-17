@@ -1,0 +1,12 @@
+{
+  "name": "video-downloader-devtest",
+  "private": true,
+  "type": "module",
+  "description": "视频嗅探下载器的真实 Chrome 端到端测试",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}

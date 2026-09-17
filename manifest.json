@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "视频嗅探下载器",
+  "version": "0.1.0",
+  "description": "自动识别页面中的视频并提供下载：支持直链文件与 HLS 分片流，可合流导出 MP4。",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "storage",
+    "downloads",
+    "tabs",
+    "scripting",
+    "webRequest",
+    "declarativeNetRequest",
+    "offscreen"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "视频嗅探下载器"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/hook.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/bridge.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["vendor/ffmpeg/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>嗅探测试页 · 视频嗅探下载器</title>
+  <style>
+    body { font-family: "Microsoft YaHei", sans-serif; margin: 32px; color: #1f1f1e; }
+    h1 { font-size: 18px; font-weight: 500; }
+    .row { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 16px; }
+    .card { border: 1px solid #e3e2dc; border-radius: 10px; padding: 12px; }
+    .cap { font-size: 12px; color: #6b6b66; margin-top: 6px; }
+    video { display: block; background: #f1efe8; }
+  </style>
+</head>
+<body>
+  <h1>视频嗅探测试页</h1>
+  <p class="cap">页面加载后扩展应当自动识别出下面这些资源，无需点击播放。</p>
+
+  <div class="row">
+    <div class="card">
+      <video id="v-direct" src="/media/sample.mp4" width="240" height="135" muted></video>
+      <div class="cap">① 直链 MP4（video src）</div>
+    </div>
+
+    <div class="card">
+      <video id="v-hls" width="240" height="135" muted>
+        <source src="/hls/master.m3u8" type="application/vnd.apple.mpegurl" />
+      </video>
+      <div class="cap">② HLS 主播放列表（source 标签）</div>
+    </div>
+
+    <div class="card">
+      <video id="v-remote" src="http://127.0.0.1:8899/media/remote.mp4" width="240" height="135" muted></video>
+      <div class="cap">③ 直链 MP4（带 query）</div>
+    </div>
+  </div>
+
+  <p><a href="/media/link-target.mp4">④ 页面里指向视频的链接</a></p>
+
+  <script>
+    // 模拟页面自己发起媒体请求：走 fetch / XHR 分支，验证 MAIN world 插桩
+    setTimeout(() => {
+      fetch('/media/fetched-by-page.mp4', { method: 'HEAD' }).catch(() => {});
+    }, 600);
+    setTimeout(() => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/media/xhr-by-page.webm', true);
+      xhr.send();
+    }, 900);
+  </script>
+</body>
+</html>

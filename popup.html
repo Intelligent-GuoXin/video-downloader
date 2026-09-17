@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>视频嗅探下载器</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="head-row">
+        <h1>视频嗅探</h1>
+        <button id="rescan" class="ghost">重新嗅探</button>
+      </div>
+      <div class="site" id="site">正在读取当前页面…</div>
+    </header>
+
+    <div id="drm" class="banner danger hidden"></div>
+    <div id="job" class="job hidden">
+      <div class="job-row">
+        <span id="job-stage">准备中</span>
+        <span id="job-pct">0%</span>
+      </div>
+      <div class="bar"><i id="job-bar"></i></div>
+      <div class="job-foot">
+        <span id="job-size" class="hint"></span>
+        <button id="job-cancel" class="ghost">取消</button>
+      </div>
+    </div>
+
+    <div id="empty" class="empty hidden">
+      <p id="empty-text">这个页面还没有嗅探到视频。</p>
+      <p class="hint">开始播放视频后通常就会出现；有些站点需要点一下播放按钮。</p>
+    </div>
+
+    <ul id="list" class="list"></ul>
+
+    <footer>
+      <button id="clear" class="ghost">清空本页记录</button>
+      <span id="count" class="hint"></span>
+    </footer>
+  </div>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
