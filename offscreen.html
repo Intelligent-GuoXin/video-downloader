@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>分片合流</title>
+</head>
+<body>
+  <!-- 先加载 UMD 版 wrapper：它靠 document.currentScript.src 推导 publicPath，
+       从而能正确找到同目录的 worker chunk（814.ffmpeg.js）。 -->
+  <script src="vendor/ffmpeg/ffmpeg.js"></script>
+  <script type="module" src="offscreen.js"></script>
+</body>
+</html>

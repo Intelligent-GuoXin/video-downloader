@@ -1,0 +1,274 @@
+:root {
+  --bg: #ffffff;
+  --panel: #f7f7f5;
+  --panel-2: #f1efe8;
+  --border: #e3e2dc;
+  --text: #1f1f1e;
+  --muted: #6b6b66;
+  --faint: #9a9a93;
+  --accent: #185fa5;
+  --accent-bg: #e6f1fb;
+  --danger: #a32d2d;
+  --danger-bg: #fcebeb;
+  --ok: #0f6e56;
+  --ok-bg: #e1f5ee;
+  --warn: #854f0b;
+  --warn-bg: #faeeda;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+}
+
+body {
+  width: 400px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.wrap {
+  display: flex;
+  flex-direction: column;
+  max-height: 580px;
+}
+
+header {
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.site {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.banner {
+  margin: 10px 14px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.banner.danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid #f0c9c9;
+}
+
+.job {
+  margin: 10px 14px 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.job-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+}
+
+.job-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 6px;
+}
+
+.bar {
+  height: 5px;
+  margin-top: 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  overflow: hidden;
+}
+
+.bar > i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 6px 8px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.item {
+  padding: 9px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 8px;
+  background: #fff;
+}
+
+.item:last-child {
+  margin-bottom: 0;
+}
+
+.item-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 16px;
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.badge.warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.badge.ok {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.item-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.item-url {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.item-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.item-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+button {
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  padding: 4px 10px;
+  background: var(--accent);
+  color: #fff;
+}
+
+button:hover {
+  opacity: 0.9;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button.ghost {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--muted);
+  padding: 3px 8px;
+}
+
+button.ghost:hover {
+  border-color: var(--faint);
+  color: var(--text);
+}
+
+select {
+  font-family: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text);
+  max-width: 130px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.empty {
+  padding: 26px 20px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.empty p {
+  margin: 0 0 4px;
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.hidden {
+  display: none !important;
+}
