@@ -1,19 +1,67 @@
 /**
  * Offscreen document：HLS 分片下载 / AES-128 解密 / ffmpeg.wasm 转封装。
  *
- * 为什么不放在 Service Worker：SW 没有 DOM、30 秒空闲就被回收，且 ffmpeg.wasm 需要
- * Worker + WebAssembly，只能在真正有 DOM 的页面里跑。
+ * 并发模型（早期版本这里是全局单任务锁，多标签页同时下载会被直接拒绝）：
+ * - 下载 + 解密：按任务并行，最多 MAX_JOBS 个任务，每个任务内部再开 CONCURRENCY 路请求。
+ * - 转封装：ffmpeg.wasm 是单实例、单线程、吃内存，所以走一条互斥队列串行执行。
+ *   整体即「并行下载 → 排队封装」，而不是简单地把并发全打开。
+ * - 每个任务持有独立的取消令牌 / AbortController / AES key 缓存 / 进度节流，
+ *   任务之间互不干扰。
  */
 
 import { parsePlaylist, ivFromHex, ivFromSequence } from './lib/m3u8.js';
 import { sanitizeName, hostOf } from './lib/media.js';
 
-const LIMIT_MP4_BYTES = 900 * 1024 * 1024; // 超过这个体积走 MP4 转封装大概率 OOM
-const CONCURRENCY = 6;
+const LIMIT_MP4_BYTES = 900 * 1024 * 1024; // 单个任务走 MP4 转封装的安全上限
+const LIMIT_TOTAL_BYTES = 1600 * 1024 * 1024; // 所有任务同时驻留内存的上限
+const CONCURRENCY = 6; // 单个任务内部的分片并发数
+const MAX_JOBS = 3; // 同时进行的任务数上限
+const PROGRESS_THROTTLE = 250;
 
-let current = null; // { jobId, cancelled }
+/** jobId -> ctx。ctx 承载该任务的全部可变状态，替代原来的全局 current。 */
+const jobs = new Map();
+
 let ffmpegInstance = null;
 let ffmpegLoading = null;
+let muxChain = Promise.resolve(); // 转封装互斥队列
+let muxBusy = false;
+let totalHeld = 0; // 所有任务已下载分片的字节数之和
+
+// ---------------------------------------------------------------------------
+// 任务上下文
+// ---------------------------------------------------------------------------
+
+function makeCtx(jobId) {
+  const controller = new AbortController();
+  return {
+    jobId,
+    cancelled: false,
+    controller,
+    signal: controller.signal,
+    keyCache: new Map(),
+    lastProgressAt: 0,
+    held: 0
+  };
+}
+
+/** 计入全局内存预算；超了就让这个任务失败，而不是把浏览器拖挂 */
+function holdBytes(ctx, n) {
+  if (!n) return;
+  ctx.held += n;
+  totalHeld += n;
+  if (totalHeld > LIMIT_TOTAL_BYTES) {
+    throw new Error(
+      `同时下载的内容已占用约 ${(totalHeld / 1024 / 1024).toFixed(0)}MB 内存，超过安全上限。` +
+        '请等当前任务完成后再开始新的下载。'
+    );
+  }
+}
+
+function releaseHeld(ctx) {
+  if (!ctx.held) return;
+  totalHeld = Math.max(0, totalHeld - ctx.held);
+  ctx.held = 0;
+}
 
 // ---------------------------------------------------------------------------
 // 与 Service Worker 通信
@@ -23,16 +71,16 @@ function report(payload) {
   return chrome.runtime.sendMessage({ target: 'sw', ...payload }).catch(() => null);
 }
 
-const stage = (jobId, text) => report({ type: 'JOB_STAGE', jobId, stage: text });
+const stage = (ctx, text) => report({ type: 'JOB_STAGE', jobId: ctx.jobId, stage: text });
 
-let lastProgressAt = 0;
-function progress(jobId, ratio, text, extra = {}) {
+/** 进度节流按任务计时，避免一个任务的进度把另一个任务的进度吞掉 */
+function progress(ctx, ratio, text, extra = {}) {
   const now = Date.now();
-  if (now - lastProgressAt < 250 && ratio < 1) return;
-  lastProgressAt = now;
+  if (ratio < 1 && now - ctx.lastProgressAt < PROGRESS_THROTTLE) return Promise.resolve(null);
+  ctx.lastProgressAt = now;
   return report({
     type: 'JOB_PROGRESS',
-    jobId,
+    jobId: ctx.jobId,
     stage: text,
     progress: Math.max(0, Math.min(100, Math.round(ratio * 100))),
     ...extra
@@ -43,37 +91,113 @@ function progress(jobId, ratio, text, extra = {}) {
 // 网络工具
 // ---------------------------------------------------------------------------
 
-async function fetchBytes(url, range, asText = false) {
+/**
+ * 按域名限流。
+ *
+ * Chrome 对同一个主机（HTTP/1.1）只开 6 条 TCP 连接。多任务并发时如果每个任务
+ * 各自开 6 路，3 个任务就是 18 个请求抢 6 条连接：队头阻塞、连接反复抢占，
+ * 聚合吞吐反而比单任务更差（实测表现就是「三个一起下巨慢」）。
+ *
+ * 所以把并发预算按域名全局分配：同一域名同时在途的请求永远不超过 6 个，
+ * 多个任务按 FIFO 公平排队。单任务时仍然是 6 路，速度不受影响。
+ */
+const HOST_INFLIGHT = 6;
+const hostSlots = new Map(); // host -> { inflight, queue }
+
+function hostKeyOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return '';
+  }
+}
+
+/** @returns {Promise<() => void>} 释放函数 */
+function acquireSlot(url, signal) {
+  const key = hostKeyOf(url);
+  if (!key) return Promise.resolve(() => {});
+
+  let slot = hostSlots.get(key);
+  if (!slot) {
+    slot = { inflight: 0, queue: [] };
+    hostSlots.set(key, slot);
+  }
+
+  if (slot.inflight < HOST_INFLIGHT) {
+    slot.inflight += 1;
+    return Promise.resolve(() => releaseSlot(key));
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      const i = slot.queue.indexOf(grant);
+      if (i >= 0) slot.queue.splice(i, 1);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      reject(new Error('已取消'));
+    };
+    const grant = () => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve(() => releaseSlot(key));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    slot.queue.push(grant);
+  });
+}
+
+function releaseSlot(key) {
+  const slot = hostSlots.get(key);
+  if (!slot) return;
+  const next = slot.queue.shift();
+  if (next) {
+    // 名额直接转交给队首，inflight 不变
+    next();
+    return;
+  }
+  slot.inflight -= 1;
+  if (slot.inflight <= 0) hostSlots.delete(key);
+}
+
+/**
+ * @param gated 是否占用域名并发名额。只有分片这种大流量请求需要；
+ *   播放列表 / 密钥 / init 段不占名额，避免「名额被 worker 占着、worker 又在等密钥」的死锁。
+ */
+async function fetchBytes(ctx, url, range, asText = false, gated = false) {
   const headers = {};
   if (range && Number.isFinite(range.length)) {
     const start = Number.isFinite(range.offset) ? range.offset : 0;
     headers.Range = `bytes=${start}-${start + range.length - 1}`;
   }
-  const res = await fetch(url, { headers, credentials: 'include' });
-  if (!res.ok && res.status !== 206) {
-    let tail = url;
-    try {
-      tail = new URL(url).pathname.slice(-40);
-    } catch {
-      /* 保持原样 */
+
+  const release = gated ? await acquireSlot(url, ctx.signal) : null;
+  try {
+    const res = await fetch(url, { headers, credentials: 'include', signal: ctx.signal });
+    if (!res.ok && res.status !== 206) {
+      let tail = url;
+      try {
+        tail = new URL(url).pathname.slice(-40);
+      } catch {
+        /* 保持原样 */
+      }
+      throw new Error(`请求失败 ${res.status}：${tail}`);
     }
-    throw new Error(`请求失败 ${res.status}：${tail}`);
+    if (asText) return await res.text();
+    return new Uint8Array(await res.arrayBuffer());
+  } finally {
+    if (release) release();
   }
-  if (asText) return res.text();
-  return new Uint8Array(await res.arrayBuffer());
 }
 
-const fetchText = (url) => fetchBytes(url, null, true);
+const fetchText = (ctx, url) => fetchBytes(ctx, url, null, true);
 
-async function pool(total, limit, worker) {
+async function pool(total, limit, worker, ctx) {
   let next = 0;
   const size = Math.max(1, Math.min(limit || CONCURRENCY, total));
   const runners = Array.from({ length: size }, async () => {
     for (;;) {
+      if (ctx.cancelled) return;
       const i = next;
       next += 1;
       if (i >= total) return;
-      if (current && current.cancelled) return;
       await worker(i);
     }
   });
@@ -84,14 +208,12 @@ async function pool(total, limit, worker) {
 // 分片下载 + 解密
 // ---------------------------------------------------------------------------
 
-const keyCache = new Map();
-
-async function decryptSegment(data, key, seq) {
-  let cryptoKey = keyCache.get(key.url);
+async function decryptSegment(ctx, data, key, seq) {
+  let cryptoKey = ctx.keyCache.get(key.url);
   if (!cryptoKey) {
-    const raw = await fetchBytes(key.url);
+    const raw = await fetchBytes(ctx, key.url);
     cryptoKey = await crypto.subtle.importKey('raw', raw, 'AES-CBC', false, ['decrypt']);
-    keyCache.set(key.url, cryptoKey);
+    ctx.keyCache.set(key.url, cryptoKey);
   }
   const iv = key.iv ? ivFromHex(key.iv) : ivFromSequence(seq);
   const plain = await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, cryptoKey, data);
@@ -108,6 +230,12 @@ function concatParts(parts) {
     off += p.byteLength;
   }
   return out;
+}
+
+function sumParts(parts) {
+  let len = 0;
+  for (const p of parts) len += p.byteLength;
+  return len;
 }
 
 /**
@@ -129,8 +257,8 @@ function interleaveParts(videoParts, audioParts) {
  * 下载一个 media playlist 的全部分片。
  * @returns {{parts: Uint8Array[], isFmp4: boolean, count: number, duration: number}}
  */
-async function downloadPlaylistParts(playlistUrl, label, onTick) {
-  const text = await fetchText(playlistUrl);
+async function downloadPlaylistParts(ctx, playlistUrl, label, onTick) {
+  const text = await fetchText(ctx, playlistUrl);
   const pl = parsePlaylist(text, playlistUrl);
 
   if (pl.type !== 'media') throw new Error(`${label} 不是媒体播放列表`);
@@ -144,25 +272,32 @@ async function downloadPlaylistParts(playlistUrl, label, onTick) {
   const out = new Array(total);
   let done = 0;
 
-  await pool(total, CONCURRENCY, async (i) => {
-    const seg = pl.segments[i];
-    let data = await fetchBytes(seg.url, seg.byteRange);
-    if (seg.key && seg.key.method === 'AES-128' && seg.key.url) {
-      try {
-        data = await decryptSegment(data, seg.key, seg.seq);
-      } catch (e) {
-        const detail = String(e && e.message ? e.message : e);
-        throw new Error(`第 ${i + 1}/${total} 个分片解密失败（AES-128）：${detail}`);
+  await pool(
+    total,
+    CONCURRENCY,
+    async (i) => {
+      const seg = pl.segments[i];
+      // 只有分片占域名并发名额，且名额在 fetch 结束后立刻释放，
+      // 后面的解密 / 取密钥都不会带着名额等待
+      let data = await fetchBytes(ctx, seg.url, seg.byteRange, false, true);
+      if (seg.key && seg.key.method === 'AES-128' && seg.key.url) {
+        try {
+          data = await decryptSegment(ctx, data, seg.key, seg.seq);
+        } catch (e) {
+          const detail = String(e && e.message ? e.message : e);
+          throw new Error(`第 ${i + 1}/${total} 个分片解密失败（AES-128）：${detail}`);
+        }
       }
-    }
-    out[i] = data;
-    done += 1;
-    if (onTick) onTick(done, total);
-  });
+      out[i] = data;
+      done += 1;
+      if (onTick) onTick(done, total);
+    },
+    ctx
+  );
 
   const parts = [];
   // fMP4 的初始化段必须排在最前面，否则解不出来
-  if (pl.map && pl.map.url) parts.push(await fetchBytes(pl.map.url));
+  if (pl.map && pl.map.url) parts.push(await fetchBytes(ctx, pl.map.url));
   for (const chunk of out) {
     if (chunk) parts.push(chunk);
   }
@@ -197,6 +332,20 @@ async function getFFmpeg() {
   return ffmpegLoading;
 }
 
+/**
+ * 转封装互斥队列。
+ * ffmpeg.wasm 只有一个实例，并发 exec 会互相读写同一份虚拟文件系统，
+ * 所以这里串行化；队列前的失败不能卡住后面的任务，因此两个 then 回调都传 task。
+ */
+function enqueueMux(task) {
+  const run = muxChain.then(task, task);
+  muxChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
 async function safeDelete(ff, name) {
   try {
     await ff.deleteFile(name);
@@ -208,12 +357,15 @@ async function safeDelete(ff, name) {
 /**
  * 转封装成 MP4（-c copy，不重新编码）。
  * TS 源里的 AAC 需要 aac_adtstoasc 位流滤镜，非 AAC 源加了会报错 —— 所以失败自动重试一次。
+ * 文件名带 jobId：即使将来放开并发，也不会互相覆盖。
  */
-async function muxToMp4(videoBytes, audioBytes, jobId) {
+async function muxToMp4(ctx, videoBytes, audioBytes) {
+  const tag = String(ctx.jobId || 'job').replace(/[^\w-]/g, '').slice(-10) || 'job';
+  const vName = `v_${tag}.bin`;
+  const aName = `a_${tag}.bin`;
+  const outName = `o_${tag}.mp4`;
+
   const ff = await getFFmpeg();
-  const vName = 'video.bin';
-  const aName = 'audio.bin';
-  const outName = 'out.mp4';
 
   await safeDelete(ff, outName);
   await ff.writeFile(vName, videoBytes);
@@ -229,19 +381,22 @@ async function muxToMp4(videoBytes, audioBytes, jobId) {
     return args;
   };
 
-  let rc = await ff.exec(build(true));
-  if (rc !== 0) {
-    await stage(jobId, '首次封装失败，改用兼容模式重试');
-    await safeDelete(ff, outName);
-    rc = await ff.exec(build(false));
-  }
-  if (rc !== 0) throw new Error('ffmpeg 转封装失败，可能是不支持的编码格式');
+  try {
+    let rc = await ff.exec(build(true));
+    if (rc !== 0) {
+      await stage(ctx, '首次封装失败，改用兼容模式重试');
+      await safeDelete(ff, outName);
+      rc = await ff.exec(build(false));
+    }
+    if (rc !== 0) throw new Error('ffmpeg 转封装失败，可能是不支持的编码格式');
 
-  const data = await ff.readFile(outName);
-  await safeDelete(ff, vName);
-  await safeDelete(ff, aName);
-  await safeDelete(ff, outName);
-  return new Uint8Array(data);
+    const data = await ff.readFile(outName);
+    return new Uint8Array(data);
+  } finally {
+    await safeDelete(ff, vName);
+    await safeDelete(ff, aName);
+    await safeDelete(ff, outName);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -254,16 +409,17 @@ function buildFilename(job, ext) {
   return `视频嗅探/${host}/${base}-${job.id.slice(-5)}.${ext}`;
 }
 
-async function runJob(job) {
-  const jobId = job.id;
-  keyCache.clear();
+function assertLive(ctx) {
+  if (ctx.cancelled) throw new Error('已取消');
+}
 
+async function runJob(job, ctx) {
   // 1) 解析播放列表
-  await progress(jobId, 0.02, '解析播放列表');
+  await progress(ctx, 0.02, '解析播放列表');
 
   let playlistUrl = job.variantUrl || job.url;
-  let text = await fetchText(playlistUrl);
-  let pl = parsePlaylist(text, playlistUrl);
+  const text = await fetchText(ctx, playlistUrl);
+  const pl = parsePlaylist(text, playlistUrl);
 
   // 走的是 master：挑清晰度，并把它挂的独立音轨地址一并取出来
   if (pl.type === 'master') {
@@ -276,39 +432,44 @@ async function runJob(job) {
     if (!job.audioUrl) job.audioUrl = pick.audioUrl || '';
   }
 
-  // 2) 视频轨
-  let done = 0;
-  const video = await downloadPlaylistParts(playlistUrl, '视频轨', (d, t) => {
-    done = d;
-    void progress(jobId, 0.05 + (d / t) * 0.7, `下载分片 ${d}/${t}`, { received: d, total: t });
-  });
-  void done;
+  assertLive(ctx);
 
-  if (current && current.cancelled) throw new Error('已取消');
+  // 2) 视频轨
+  const video = await downloadPlaylistParts(ctx, playlistUrl, '视频轨', (d, t) => {
+    void progress(ctx, 0.05 + (d / t) * 0.7, `下载分片 ${d}/${t}`, { received: d, total: t });
+  });
+
+  assertLive(ctx);
 
   // 3) 独立音轨（master 用 EXT-X-MEDIA 分离音频时才会有）
   let audio = null;
   if (job.audioUrl && job.audioUrl !== playlistUrl) {
-    await stage(jobId, '下载音轨分片');
-    audio = await downloadPlaylistParts(job.audioUrl, '音频轨', (d, t) => {
-      void progress(jobId, 0.75 + (d / t) * 0.15, `下载音轨 ${d}/${t}`, { received: d, total: t });
+    await stage(ctx, '下载音轨分片');
+    audio = await downloadPlaylistParts(ctx, job.audioUrl, '音频轨', (d, t) => {
+      void progress(ctx, 0.75 + (d / t) * 0.15, `下载音轨 ${d}/${t}`, { received: d, total: t });
     });
   }
 
-  if (current && current.cancelled) throw new Error('已取消');
+  assertLive(ctx);
 
   const ext = job.output === 'ts' && !video.isFmp4 ? 'ts' : 'mp4';
 
   // 4) 输出
-  let outBytes;
+  let blob;
   if (ext === 'ts') {
-    // 纯拼接，秒级完成、零依赖。有独立音轨时按段交错，保证声画同步。
-    await progress(jobId, 0.93, '拼接 TS');
-    outBytes = concatParts(audio ? interleaveParts(video.parts, audio.parts) : video.parts);
+    // 不做 concat：拼接成一整块连续内存会让峰值翻倍，多任务并发时直接触发 GC 抖动。
+    // 直接把分片数组交给 Blob，Chrome 会把大 Blob 落到磁盘，峰值内存从 2 倍降到 1 倍。
+    // 有独立音轨时按段交错，保证声画同步。
+    await progress(ctx, 0.93, '拼接 TS');
+    const parts = audio ? interleaveParts(video.parts, audio.parts) : video.parts;
+    blob = new Blob(parts, { type: 'video/mp2t' });
   } else {
     const videoBytes = concatParts(video.parts);
     const audioBytes = audio ? concatParts(audio.parts) : null;
     const sumBytes = videoBytes.byteLength + (audioBytes ? audioBytes.byteLength : 0);
+
+    // 记账：把已下载的分片计入全局内存预算
+    holdBytes(ctx, sumParts(video.parts) + (audio ? sumParts(audio.parts) : 0));
 
     if (sumBytes > LIMIT_MP4_BYTES) {
       throw new Error(
@@ -316,25 +477,34 @@ async function runJob(job) {
           '请改用「TS 直出」格式下载，再用本机播放器/VLC 处理。'
       );
     }
-    await progress(jobId, 0.9, '加载 ffmpeg 引擎');
+    await progress(ctx, 0.9, '加载 ffmpeg 引擎');
     await getFFmpeg();
-    await stage(jobId, '转封装为 MP4');
-    await progress(jobId, 0.94, '转封装为 MP4');
-    outBytes = await muxToMp4(videoBytes, audioBytes, jobId);
+    if (muxBusy) await stage(ctx, '排队等待转封装（引擎被其他任务占用）');
+    await progress(ctx, 0.94, '转封装为 MP4');
+    const mp4 = await enqueueMux(async () => {
+      muxBusy = true;
+      try {
+        assertLive(ctx);
+        return await muxToMp4(ctx, videoBytes, audioBytes);
+      } finally {
+        muxBusy = false;
+      }
+    });
+    blob = new Blob([mp4], { type: 'video/mp4' });
   }
 
-  await progress(jobId, 0.99, '生成下载文件');
+  assertLive(ctx);
+  await progress(ctx, 0.99, '生成下载文件');
 
-  const mime = ext === 'ts' ? 'video/mp2t' : 'video/mp4';
-  const blobUrl = URL.createObjectURL(new Blob([outBytes], { type: mime }));
+  const blobUrl = URL.createObjectURL(blob);
 
   await report({
     type: 'JOB_READY',
-    jobId,
+    jobId: ctx.jobId,
     blobUrl,
     filename: buildFilename(job, ext),
-    mime,
-    size: outBytes.byteLength
+    mime: blob.type,
+    size: blob.size
   });
 }
 
@@ -379,7 +549,8 @@ async function engineSelfTest() {
       const gen = await ff.readFile(genName);
       genSize = gen.byteLength;
       try {
-        const mp4 = await muxToMp4(new Uint8Array(gen), null, 'selftest');
+        const ctx = { jobId: 'selftest', cancelled: false };
+        const mp4 = await enqueueMux(() => muxToMp4(ctx, new Uint8Array(gen), null));
         rcMux = 0;
         mp4Size = mp4.byteLength;
       } catch (e) {
@@ -421,25 +592,52 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === 'JOB_START') {
-    if (current && !current.cancelled) {
-      sendResponse({ ok: false, error: '已有任务在跑' });
+    const jobId = msg.job && msg.job.id;
+    if (!jobId) {
+      sendResponse({ ok: false, error: '任务缺少 id' });
       return true;
     }
-    current = { jobId: msg.job.id, cancelled: false };
+    if (jobs.has(jobId)) {
+      sendResponse({ ok: false, error: '该任务已在运行' });
+      return true;
+    }
+    if (jobs.size >= MAX_JOBS) {
+      sendResponse({
+        ok: false,
+        error: `同时下载任务已达上限（${MAX_JOBS} 个），请等待其他任务完成`
+      });
+      return true;
+    }
+
+    const ctx = makeCtx(jobId);
+    jobs.set(jobId, ctx);
     sendResponse({ ok: true });
-    runJob(msg.job)
+
+    runJob(msg.job, ctx)
       .catch(async (e) => {
+        // 主动取消不算失败：background 已经把状态改成「已取消」
+        if (ctx.cancelled) return;
         const message = String(e && e.message ? e.message : e);
-        await report({ type: 'JOB_ERROR', jobId: msg.job.id, message });
+        await report({ type: 'JOB_ERROR', jobId, message });
       })
       .finally(() => {
-        if (current && current.jobId === msg.job.id) current = null;
+        releaseHeld(ctx);
+        jobs.delete(jobId);
       });
     return true;
   }
 
   if (msg.type === 'JOB_CANCEL') {
-    if (current && current.jobId === msg.jobId) current.cancelled = true;
+    const ctx = jobs.get(msg.jobId);
+    if (ctx) {
+      ctx.cancelled = true;
+      // 中断在途请求，取消能立刻生效，不用等当前分片下完
+      try {
+        ctx.controller.abort();
+      } catch {
+        /* 忽略 */
+      }
+    }
     sendResponse({ ok: true });
     return true;
   }

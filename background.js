@@ -23,6 +23,7 @@ import * as store from './lib/store.js';
 
 const OFFSCREEN_URL = 'offscreen.html';
 const REFERER_RULE_ID = 9001;
+const MAX_REFERER_RULES = 20;
 const VISIBLE_KINDS = new Set(['hls', 'dash', 'direct', 'audio']);
 
 let offscreenCreating = null;
@@ -315,46 +316,98 @@ async function startHlsJob({ tabId, itemId, variantUrl, audioUrl, output }) {
   await ensureOffscreen();
 
   // 部分 CDN 会校验 Referer，缺了直接 403。只在任务期间挂规则，结束就摘掉。
-  if (job.pageUrl) await applyRefererRule(job.pageUrl);
+  if (job.pageUrl) await applyRefererRule(job);
 
-  await toOffscreen({ type: 'JOB_START', job });
+  // 必须看回执：offscreen 可能因为并发上限 / 引擎异常拒绝这个任务，
+  // 早期版本把回执吞掉，界面就会永远停在「准备中 0%」。
+  try {
+    await startJobOnOffscreen(job);
+  } catch (e) {
+    const reason = String(e && e.message ? e.message : e);
+    await clearRefererRule(job.id);
+    await store.patchJob(job.id, { stage: '失败', error: reason });
+    throw new Error(reason);
+  }
+
   await toPopup({ type: 'JOB_UPDATE', job });
   return job;
 }
 
-async function applyRefererRule(referer) {
-  try {
-    await chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [REFERER_RULE_ID],
-      addRules: [
-        {
-          id: REFERER_RULE_ID,
-          priority: 1,
-          action: {
-            type: 'modifyHeaders',
-            requestHeaders: [{ header: 'referer', operation: 'set', value: referer }]
-          },
-          condition: { urlFilter: '*', resourceTypes: ['xmlhttprequest'] }
-        }
-      ]
+/**
+ * 把任务交给 offscreen，并确认它真的接下了。
+ * offscreen 刚被创建时监听器可能还没挂上，第一次投递会拿不到回执，因此重试一次；
+ * 重试若撞上「已在运行」，说明第一次其实已经生效，按成功处理。
+ */
+async function startJobOnOffscreen(job) {
+  let ack = await toOffscreen({ type: 'JOB_START', job });
+  if (!ack) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    ack = await toOffscreen({ type: 'JOB_START', job });
+  }
+  if (ack && ack.ok) return;
+  if (ack && ack.error === '该任务已在运行') return;
+  throw new Error((ack && ack.error) || '无法与下载引擎通信（offscreen 未就绪）');
+}
+
+/**
+ * Referer 规则按任务隔离。
+ *
+ * 早期版本写死一条 ID 9001 的全局规则，多标签页并发时后者会覆盖前者的 Referer，
+ * 先跑的任务立刻开始 403。这里改成：每个任务一条规则，按播放列表所在域名限定
+ * 作用范围（HLS 分片通常与播放列表同源），任务结束只摘自己那一条。
+ */
+const refererJobs = new Map(); // jobId -> { host, referer }
+let refererRuleIds = [];
+
+function buildRefererRules() {
+  const rules = [];
+  const seenHost = new Set();
+  let id = REFERER_RULE_ID;
+  // 同一域名只留一条（后加入的任务优先），避免两条规则争同一个头
+  for (const entry of [...refererJobs.values()].reverse()) {
+    if (!entry.host || seenHost.has(entry.host)) continue;
+    if (id >= REFERER_RULE_ID + MAX_REFERER_RULES) break;
+    seenHost.add(entry.host);
+    rules.push({
+      id: id++,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders: [{ header: 'referer', operation: 'set', value: entry.referer }]
+      },
+      condition: { urlFilter: `||${entry.host}`, resourceTypes: ['xmlhttprequest'] }
     });
+  }
+  return rules;
+}
+
+async function syncRefererRules() {
+  const removeRuleIds = refererRuleIds;
+  const addRules = buildRefererRules();
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds, addRules });
+    refererRuleIds = addRules.map((r) => r.id);
   } catch {
     /* 规则失败不该拖垮下载 */
   }
 }
 
-async function clearRefererRule() {
-  try {
-    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [REFERER_RULE_ID] });
-  } catch {
-    /* 忽略 */
-  }
+async function applyRefererRule(job) {
+  const host = hostOf(job.variantUrl || job.url);
+  if (!job.pageUrl || !host) return;
+  refererJobs.set(job.id, { host, referer: job.pageUrl });
+  await syncRefererRules();
+}
+
+async function clearRefererRule(jobId) {
+  if (!refererJobs.delete(jobId)) return;
+  await syncRefererRules();
 }
 
 async function cancelJob(jobId) {
   await toOffscreen({ type: 'JOB_CANCEL', jobId });
   await store.patchJob(jobId, { stage: '已取消', cancelled: true });
-  await clearRefererRule();
+  await clearRefererRule(jobId);
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +422,7 @@ chrome.downloads.onChanged.addListener(async (delta) => {
   if (!delta.state || (delta.state.current !== 'complete' && delta.state.current !== 'interrupted')) return;
 
   trackedDownloads.delete(delta.id);
-  await clearRefererRule();
+  await clearRefererRule(tracked.jobId);
 
   await store.patchJob(tracked.jobId, {
     stage: delta.state.current === 'complete' ? '已完成' : '下载被中断',
@@ -575,7 +628,7 @@ async function handleOffscreenReport(msg) {
     });
   } else if (msg.type === 'JOB_ERROR') {
     await store.patchJob(jobId, { stage: '失败', error: msg.message || '未知错误' });
-    await clearRefererRule();
+    await clearRefererRule(jobId);
   } else if (msg.type === 'JOB_READY') {
     try {
       const downloadId = await chrome.downloads.download({
@@ -596,7 +649,7 @@ async function handleOffscreenReport(msg) {
         error: `保存失败：${String(e && e.message ? e.message : e)}`
       });
       await toOffscreen({ type: 'RELEASE_BLOB', blobUrl: msg.blobUrl });
-      await clearRefererRule();
+      await clearRefererRule(jobId);
     }
   }
 
