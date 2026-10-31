@@ -16,7 +16,8 @@ import {
   pathKey,
   shortHash,
   hostOf,
-  sanitizeName
+  sanitizeName,
+  resumeKeyOf
 } from './lib/media.js';
 import { parsePlaylist } from './lib/m3u8.js';
 import * as store from './lib/store.js';
@@ -298,6 +299,9 @@ async function startHlsJob({ tabId, itemId, variantUrl, audioUrl, output }) {
     url: item.url,
     variantUrl: variantUrl || '',
     audioUrl: audioUrl || '',
+    // 断点续传身份：同一个视频（token 变了也算同一个）永远算出同样的值，
+    // offscreen 用它决定分片目录，从而能接着上次的进度下。
+    downloadKey: resumeKeyOf(variantUrl || item.url),
     output: output === 'ts' ? 'ts' : 'mp4',
     pageUrl: state.url || '',
     title: item.title || state.title || '',
@@ -430,6 +434,12 @@ chrome.downloads.onChanged.addListener(async (delta) => {
   });
   const job = await store.getJob(tracked.jobId);
   await toPopup({ type: 'JOB_UPDATE', job });
+
+  // 文件已经落到用户磁盘了，分片目录可以清掉；
+  // 中断的情况要保留 —— 那正是下次续传的凭据。
+  if (delta.state.current === 'complete' && job && job.downloadKey) {
+    await toOffscreen({ type: 'PURGE_JOB', downloadKey: job.downloadKey });
+  }
 
   // 让 offscreen 释放这个 blob，否则内存会一直占着
   await toOffscreen({ type: 'RELEASE_BLOB', blobUrl: tracked.blobUrl });

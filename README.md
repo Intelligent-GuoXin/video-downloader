@@ -1,7 +1,7 @@
 # 视频嗅探下载器
 
 Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频，在 popup 里列出来并提供下载。
-支持直链文件与 HLS 分片流，可用 ffmpeg.wasm 在浏览器里转封装成 MP4。
+支持直链文件与 HLS 分片流，可在浏览器里把 TS 流式重封装成标准 MP4（不重编码、无体积上限）。
 
 **零构建**：原生 JS + ESM，改完代码在 `chrome://extensions` 点刷新即可，没有 npm install、没有打包步骤。
 
@@ -13,7 +13,8 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 |---|---|---|
 | ✅ | 直链文件（`.mp4` / `.webm` / `.mov` / `.mkv` …） | 直接调浏览器下载，自动带 Cookie / UA / Referer |
 | ✅ | HLS（`.m3u8`） | 支持 master 清晰度选择、独立音轨、AES-128 解密、分片并发下载 |
-| ✅ | HLS 输出格式 | `MP4 合流`（ffmpeg.wasm 转封装）或 `TS 直出`（纯拼接，秒级） |
+| ✅ | HLS 输出格式 | `MP4 合流`（流式重封装，不重编码、无体积上限，1.5GB 也能出）或 `TS 直出`（纯拼接，秒级） |
+| ✅ | 断点续传 | 分片边下边落盘（OPFS），失败 / 取消 / 关掉浏览器后重新点下载，从断点继续 |
 | ❌ | DASH（`.mpd`） | 已识别但未实现下载（界面显示「暂不支持」） |
 | ❌ | **DRM 加密内容**（Netflix / Disney+ / Prime Video / HBO / Apple TV+） | **设计上不做**。解密发生在浏览器内置 CDM 黑盒里，扩展没有任何 API 能碰；绕过 DRM 也违反法律与商店政策。检测到 EME 时界面会明确提示 |
 | ❌ | 直播流 | 未出现 `EXT-X-ENDLIST` 的播放列表会明确报错 |
@@ -64,7 +65,7 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 按钮含义：
 
 - **重新嗅探** —— 手动触发一次 DOM 扫描
-- **MP4 合流** —— 走 ffmpeg.wasm，输出标准 MP4，速度慢（要加载 32MB wasm）
+- **MP4 合流** —— 自研流式重封装（不重编码，只换容器）。速度取决于磁盘 I/O，**没有体积上限**
 - **TS 直出（快）** —— 只把分片拼起来，秒级完成；有独立音轨时会按段交错保证声画同步。VLC / PotPlayer 可直接播
 
 `popup.html#tab=<标签页ID>` 可以当普通页面打开，用于调试指定标签页。
@@ -79,7 +80,10 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 | `background.js` | Service Worker：嗅探归并 + 下载编排 + 消息路由 |
 | `content/hook.js` | **MAIN world** 插桩：包 `fetch` / `XHR` / `MediaSource` / `requestMediaKeySystemAccess` |
 | `content/bridge.js` | ISOLATED world：DOM 扫描 + 桥接页面消息 + 上报后台 |
-| `offscreen.html` / `offscreen.js` | 跑重活的地方：分片下载、AES-128 解密、ffmpeg.wasm 转封装 |
+| `offscreen.html` / `offscreen.js` | 跑重活的地方：分片下载、AES-128 解密、流式重封装 |
+| `lib/tsdemux.js` | MPEG-TS 解封装：PAT/PMT/PES → H.264 访问单元（AVCC）+ AAC 帧 |
+| `lib/mp4mux.js` | MP4 封装：元数据进 `moov`、样本数据边生成边落盘，内存与文件大小无关 |
+| `lib/segstore.js` | 分片落盘（OPFS）：断点续传的载体，也是「不把整个视频塞进内存」的关键 |
 | `lib/media.js` | 媒体类型识别、格式化工具 |
 | `lib/m3u8.js` | 零依赖 m3u8 解析器（master / media / KEY / MAP / BYTERANGE） |
 | `lib/store.js` | 基于 `chrome.storage.session` 的状态层 |
@@ -105,11 +109,16 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 
 ## 已知限制
 
-- **单文件体积**：MP4 转封装走内存 + MEMFS，超过约 900MB 会主动报错并提示改用 TS 直出。ffmpeg.wasm 单线程版在 300–600MB 以内比较稳。
+- **单文件体积**：MP4 合流走流式重封装，`mdat` 边解析边落盘，常驻内存只有每帧十几字节的
+  索引（实测 91MB 素材峰值堆内存 6.4MB），**不再有 900MB 上限**，1.5GB 以上也能直接出 MP4。
+  唯一的硬上限是单个 MP4 不能超过 4GB（32 位 box 长度）。
+- **续传的判定依据**：分片目录按「origin + pathname + 非签名参数」算的 key 归档。
+  如果站点把视频 ID 塞在签名参数里（每次点开都变），就认不出是同一个视频，会重新下载。
 - **`SameSite` Cookie**：offscreen 的请求是跨站发起的，`SameSite=Lax/Strict` 的 Cookie 不会带上。签名 URL（token 在 query 里）不受影响；纯靠 Cookie 鉴权的分片可能 403。
 - **加密格式**：只支持 `AES-128`（key 在 m3u8 里）。`SAMPLE-AES` 属于 DRM 范畴，不支持。
 - **`EXT-X-BYTERANGE`** 支持 Range 请求；服务端不支持 Range 时会失败。
-- **首次 MP4 合流较慢**：要加载 32MB wasm。
+- **MP4 合流的适用面**：只处理 H.264 + AAC 的 TS 分片（含分离音轨）。遇到 HEVC、SAMPLE-AES 等
+  非常规封装时，小文件会回退 ffmpeg.wasm 兜底，大文件则给 TS 直出并说明原因。
 - **C 档站点**：YouTube 有 signature 混淆 + PoToken、B 站有 WBI 签名，URL 抓下来直接请求会 403。本插件是「实时捕获」而非事后构造，能缓解但仍拿不到可用文件 —— 具体原因见上文「常见站点会怎样」。
 
 ---
@@ -160,7 +169,9 @@ VD_CHROME="/path/to/chrome.exe" node devtest/run.mjs
   这类站点目前需要手填 URL（后续可接 `chrome.debugger` 深度模式）。
 - **HLS 下出来没有声音**：说明该 master 用 `EXT-X-MEDIA` 分离了音轨。正常情况下插件会自动带上音频轨道；
   如果音频是加密的 `SAMPLE-AES`，会明确报错。
-- **下载到一半失败**：留意 popup 里的错误文案，会区分「请求失败 4xx」「分片解密失败」「转封装失败」。
+- **下载到一半失败**：已下载的分片会留在浏览器私有存储里，**同一个视频再点一次下载就会从断点继续**，
+  不会从头再来。错误文案会区分「请求失败 4xx」「分片解密失败」「转封装失败」，并说明分片是否已保留。
+  单个分片本身失败会自动重试 4 次，多数网络抖动扛得过去。
 - **`视频嗅探` 目录下文件名很长**：命名规则是 `<页面标题>-<id>`，可在 `background.js` 的
   `buildFilename` / `offscreen.js` 的 `buildFilename` 里调整。
 
