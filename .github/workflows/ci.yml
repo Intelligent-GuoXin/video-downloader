@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: 端到端测试（真实 Chrome）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 安装 Chrome 稳定版
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q google-chrome-stable
+
+      - name: 安装测试依赖
+        working-directory: devtest
+        run: npm ci || npm install --no-save puppeteer-core
+
+      - name: 语法检查
+        run: |
+          for f in background.js offscreen.js popup.js content/*.js jobs/*.js offscreen/*.js lib/*.js; do
+            node --input-type=module --check < "$f" || { echo "语法错误: $f"; exit 1; }
+          done
+
+      - name: 端到端测试
+        env:
+          VD_CHROME: /usr/bin/google-chrome-stable
+          VD_CHROME_ARGS: --no-sandbox --disable-gpu
+        run: node devtest/run.mjs

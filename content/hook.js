@@ -42,6 +42,16 @@
     }
   };
 
+  // ---------- 媒体请求完成记录 ----------
+  // 「正在播放的是哪条流」只能靠喂流关系推断：播放器刚 fetch 完一个分片，
+  // 紧接着就把它 appendBuffer 进 MediaSource。这里记下最近完成的媒体请求，
+  // appendBuffer 发生时取「最近完成的那条」作为被喂入的地址上报。
+  const recentMedia = []; // { url, doneAt }
+  const noteMediaDone = (url) => {
+    recentMedia.push({ url, doneAt: performance.now() });
+    if (recentMedia.length > 12) recentMedia.shift();
+  };
+
   // ---------- 1. DRM / EME 探测 ----------
   // 页面调用 requestMediaKeySystemAccess 就说明在用 CDM 解密，这类内容我们做不了，
   // 必须早点告诉用户，而不是让他下到一堆没法播的加密分片。
@@ -57,8 +67,9 @@
     /* 忽略 */
   }
 
-  // ---------- 2. MSE 探测 ----------
+  // ---------- 2. MSE 探测 + 喂流追踪 ----------
   // 页面往 SourceBuffer 里塞数据 → 说明是分片流播放器，DOM 里的 blob: 地址没有意义。
+  const msBlobs = new WeakMap(); // MediaSource -> blob: URL
   try {
     const MS = window.MediaSource;
     if (MS && MS.prototype && typeof MS.prototype.addSourceBuffer === 'function') {
@@ -73,11 +84,59 @@
       URL.createObjectURL = function (obj) {
         const url = origCreate.apply(this, arguments);
         try {
-          if (MS && obj instanceof MS) send({ kind: 'blob', url });
+          if (MS && obj instanceof MS) {
+            send({ kind: 'blob', url });
+            msBlobs.set(obj, url);
+          }
         } catch {
           /* 忽略 */
         }
         return url;
+      };
+    }
+
+    // appendBuffer 插桩：这是「哪条流正在被消费」的最直接证据。
+    // 抖音这类信息流页面会预加载下一条视频（它也有 MediaSource、也在 append），
+    // 只看请求时间根本分不清谁在播；喂流关系 + 播放器元素状态才能分清。
+    const SB = window.SourceBuffer && window.SourceBuffer.prototype;
+    const sbOwner = new WeakMap(); // SourceBuffer -> MediaSource
+    if (SB && typeof SB.appendBuffer === 'function') {
+      const origAddSB = MS && MS.prototype && MS.prototype.addSourceBuffer;
+      if (origAddSB) {
+        MS.prototype.addSourceBuffer = function () {
+          const sb = origAddSB.apply(this, arguments);
+          try {
+            sbOwner.set(sb, this);
+          } catch {
+            /* 忽略 */
+          }
+          return sb;
+        };
+      }
+      let lastFeedAt = 0;
+      const origAppend = SB.appendBuffer;
+      SB.appendBuffer = function () {
+        try {
+          const now = performance.now();
+          if (now - lastFeedAt >= 400) {
+            lastFeedAt = now;
+            let hit = null;
+            for (let i = recentMedia.length - 1; i >= 0; i -= 1) {
+              const r = recentMedia[i];
+              if (now - r.doneAt > 2000) break;
+              hit = r;
+              break;
+            }
+            if (hit) {
+              const ms = sbOwner.get(this);
+              const blobUrl = ms ? msBlobs.get(ms) : '';
+              if (blobUrl) send({ kind: 'feed', url: hit.url, blobUrl });
+            }
+          }
+        } catch {
+          /* 忽略 */
+        }
+        return origAppend.apply(this, arguments);
       };
     }
   } catch {
@@ -89,16 +148,24 @@
     const origFetch = window.fetch;
     if (typeof origFetch === 'function') {
       window.fetch = function (input, init) {
+        let mediaUrl = '';
         try {
           const raw = typeof input === 'string' ? input : input && input.url;
-          if (raw && MEDIA_RE.test(raw)) {
-            const url = absolute(raw);
-            if (url) send({ kind: 'url', url, via: 'fetch' });
-          }
+          if (raw && MEDIA_RE.test(raw)) mediaUrl = absolute(raw);
+          if (mediaUrl) send({ kind: 'url', url: mediaUrl, via: 'fetch' });
         } catch {
           /* 忽略 */
         }
-        return origFetch.apply(this, arguments);
+        const p = origFetch.apply(this, arguments);
+        if (mediaUrl) {
+          p.then(
+            (res) => {
+              if (res && res.ok) noteMediaDone(mediaUrl);
+            },
+            () => {}
+          );
+        }
+        return p;
       };
     }
   } catch {
@@ -114,7 +181,20 @@
         try {
           if (url && MEDIA_RE.test(url)) {
             const abs = absolute(url);
-            if (abs) send({ kind: 'url', url: abs, via: 'xhr' });
+            if (abs) {
+              send({ kind: 'url', url: abs, via: 'xhr' });
+              this.addEventListener(
+                'loadend',
+                () => {
+                  try {
+                    if (this.status >= 200 && this.status < 300) noteMediaDone(abs);
+                  } catch {
+                    /* 忽略 */
+                  }
+                },
+                { once: true }
+              );
+            }
           }
         } catch {
           /* 忽略 */

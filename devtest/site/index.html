@@ -36,6 +36,20 @@
   </div>
 
   <p><a href="/media/link-target.mp4">④ 页面里指向视频的链接</a></p>
+  <p><a href="/media/ref-gated.mp4">⑤ 需要 Referer 才放行的直链（模拟抖音 CDN）</a></p>
+  <p>
+    <a href="/media/vonly.mp4">⑥ 只有视频轨</a> ·
+    <a href="/media/aonly.mp4">⑦ 只有音频轨</a>（模拟抖音音视频分离下发）
+  </p>
+  <p>
+    <a href="/media/frag.mp4">⑧ 分片流（fMP4 的 m4s）</a> ·
+    <a href="/media/truncated.mp4">⑨ 会被中途掐断的下载</a>
+  </p>
+  <p>
+    <a href="/dash/v.mp4">⑩ DASH 视频流</a> ·
+    <a href="/dash/a.mp4">⑪ DASH 音频流</a>（模拟抖音：两条独立地址，各自只有一条轨）·
+    <a href="/dash/a-short.mp4">⑫ 时长对不上的音频流（模拟别条视频的音轨）</a>
+  </p>
 
   <script>
     // 模拟页面自己发起媒体请求：走 fetch / XHR 分支，验证 MAIN world 插桩
@@ -47,6 +61,11 @@
       xhr.open('GET', '/media/xhr-by-page.webm', true);
       xhr.send();
     }, 900);
+    setTimeout(() => {
+      // 像真实播放器一样把两条 DASH 流都请求一遍（触发「最近请求」候选）
+      fetch('/dash/a.mp4', { method: 'HEAD' }).catch(() => {});
+      fetch('/dash/a-short.mp4', { method: 'HEAD' }).catch(() => {});
+    }, 1200);
   </script>
 </body>
 </html>

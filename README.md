@@ -1,9 +1,11 @@
 # 视频嗅探下载器
 
 Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频，在 popup 里列出来并提供下载。
-支持直链文件与 HLS 分片流，可在浏览器里把 TS 流式重封装成标准 MP4（不重编码、无体积上限）。
+支持直链文件与 HLS 分片流，可在浏览器里把 TS 流式重封装成标准 MP4（不重编码、无体积上限）；
+抖音这类「音视频分离下发 / Referer 白名单 / fMP4 分片流」的站点有专门处理。
 
 **零构建**：原生 JS + ESM，改完代码在 `chrome://extensions` 点刷新即可，没有 npm install、没有打包步骤。
+**零依赖**：自 0.5.0 起不再内置 ffmpeg.wasm —— 解封装 / 重封装 / 合流全部是自研纯 JS，仓库里没有二进制大文件。
 
 ---
 
@@ -12,6 +14,12 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 | | 类型 | 支持情况 |
 |---|---|---|
 | ✅ | 直链文件（`.mp4` / `.webm` / `.mov` / `.mkv` …） | 直接调浏览器下载，自动带 Cookie / UA / Referer |
+| ✅ | **Referer 白名单直链**（抖音 / TikTok 这类 CDN） | 探测到 403 时自动切到「带 Referer 抓取 → 落盘 → 另存」，进度条照常显示 |
+| ✅ | **音视频分离下发的直链** | 认出「仅视频」「仅音频」，按**时长**配对后用纯 JS 无损合成一个 MP4（remux，不重编码、无体积上限） |
+| ✅ | **DASH 分离流（抖音搜索页这类）** | 视频流、音频流是两条独立地址且**探不出轨道**。点视频那条：下载 → 解析 → 自动抓同页最近的候选 → 认出纯音轨且**时长匹配** → 合并成一个文件 |
+| ✅ | **正在播放识别** | 信息流页面预加载的「下一条」不会被当成当前视频（见下文「怎么认出正在播放的那个」） |
+| ✅ | 下载完整性校验 | 按 `Content-Length` 对账；连接被掐断的文件当场判失败，不会把残片当成品交付 |
+| ✅ | 分片流单条（fMP4 的 `.m4s`） | 下载后自动转成标准 MP4（把样本表从 `moof` 搬进 `stbl`），播放器直接能播 |
 | ✅ | HLS（`.m3u8`） | 支持 master 清晰度选择、独立音轨、AES-128 解密、分片并发下载 |
 | ✅ | HLS 输出格式 | `MP4 合流`（流式重封装，不重编码、无体积上限，1.5GB 也能出）或 `TS 直出`（纯拼接，秒级） |
 | ✅ | 断点续传 | 分片边下边落盘（OPFS），失败 / 取消 / 关掉浏览器后重新点下载，从断点继续 |
@@ -27,9 +35,78 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 |---|---|---|---|
 | 标准 mp4 直链 | 教程站、企业官网、各类 CMS | ✅ 直接下 | — |
 | 标准 HLS | 多数国内视频站、教育平台、直播回放、自建播放器 | ✅ 可用 | — |
+| **抖音网页版** | douyin.com | ✅ **可用** | 需二次请求（带 Referer），见下 |
+| **抖音搜索页 / 推荐流** | douyin.com | ✅ **可用** | DASH 分离流 + 预加载干扰，见下 |
 | **YouTube** | youtube.com | ❌ **拿不到可用文件** | 三重障碍，见下 |
 | Netflix / Disney+ / Prime Video / HBO | — | ❌ | DRM（解密在 CDM 黑盒里） |
 | B 站 / 腾讯视频 / 爱奇艺 | — | ⚠️ 视具体页面 | 多为 DASH + 签名，同上 |
+
+**抖音为什么需要单独处理** —— CDN（`douyinvod.com`）按 Referer 白名单判权：
+
+| 请求 | 结果 |
+|---|---|
+| 不带 Referer | 403 `Forbid_code: 020200` |
+| `Referer: https://www.douyin.com/`（或任意 `/video/<id>`） | 200 / 206，正常返回 |
+
+关键在于：`chrome.downloads.download()` 发出的请求**既不带页面 Referer，也不吃扩展的 `declarativeNetRequest` 改写规则**
+（实测同一条规则下，扩展内 `fetch` 拿 200、浏览器下载请求拿 403）。所以插件的做法是：
+
+1. 点下载时先探一个字节（`Range: bytes=0-0`）；
+2. 放行 → 照旧交给浏览器下载器（可续传、不占扩展内存）；
+3. 401 / 403 → 挂上临时 Referer 规则，改在 offscreen 里 `fetch`（这条路径规则是生效的），
+   边收边写 OPFS，落盘后用 blob URL 交给下载器；
+4. 下载器自己撞上 403 时，也会自动回退到第 3 步再试一次。
+
+签名 URL 同时绑时间，链接放久了（几小时）会失效，重新打开页面点播放再嗅探即可。
+
+**怎么认出「正在播放的那个」** —— 信息流页面（抖音搜索页 / 推荐流）会预加载一串别的视频，
+它们同样产生媒体请求，甚至同样有 MediaSource、同样在往里 append 数据。只看「最近谁在请求」，
+排最前面的往往是「下一条」，一点下载就下错。插件用三层证据把它区分开：
+
+1. **喂流关系（最硬的证据）**：MAIN world 插桩包了 `SourceBuffer.appendBuffer`，
+   播放器把刚下载的分片喂进某个 MediaSource 时，把「最近完成的媒体请求」与该
+   MediaSource 的 blob 地址一起上报；
+2. **播放器元素状态**：ISOLATED world 的桥接脚本核对挂着该 blob 地址的 `<video>`
+   元素确实在播（未暂停 / 进度在走），预加载视频是暂停的，过不了这一关；
+3. **标记带 TTL**：DASH 场景视频流、音频流交替被喂，两条都算「正在播放」；
+   超过 15 秒没有再被喂的，摘掉标记。
+
+列表里命中的条目带 **▶ 正在播放** 徽标并置顶排序；直连 `<video src>` 的页面则直接看元素状态。
+
+**音视频分离怎么办** —— 抖音有一部分页面（搜索页、推荐流）不是给一个完整 MP4，
+而是**一个只有视频轨的 mp4 + 一个只有音频轨的 mp4**，直接各下各的，结果就是「没声音的画面」
+加一个音频文件。插件现在的处理是：
+
+1. 打开 popup 时对**所有**直链条目各探一次 64KB 头部，解析 `moov` 里的 `hdlr` / `stsd` / `stsz`，
+   标注成「仅视频（需配音频）」「仅音频」「音视频」；
+2. 「仅视频」条目按**时长**去配「仅音频」条目（差值 ≤ 0.6 秒或 1%）：同页十几条视频时，
+   光看「有音频」就配会把 A 的声音接到 B 的画面上。时长对不上的一律不给配；
+   视频自身时长未知时也不配（没有任何证据，宁可不配）。
+   按钮变成 **下载（含音频）**，多个候选给下拉，也能点「仅视频」只下画面；
+3. 下载时两段一起抓，再用 `lib/mp4remux.js` 合成：`stsd`（含 `hvcC` / `avcC` / `esds`）
+   与各容器 box 原样搬运，只重排样本表和 chunk 偏移，**不解码、不重编码**；
+4. **合并前的硬校验（0.5.0 起）**：双方时长都已知时必须对得上（差 ≤ 0.8s 或 2%），
+   对不上直接判失败并说明「这多半是同页另一个视频的音轨」——
+   以前会安静地合成出一个「画面 2 秒、声音 4 秒」的错位文件，这是「总是下错视频」的安静版本。
+
+**DASH 分离流（探不出轨道的那种）** —— 抖音搜索页的 MSE 链路给的是两条独立流地址
+（视频一条、音频一条），而且分片 URL 上 64KB 探测读不到 `moov`，列表里既没标签也没配对按钮。
+这种条目点「下载」时的完整流程：
+
+1. 抓取完整内容（DASH 地址不带 Range 请求会返回整条流）；
+2. 转成标准 MP4 并解析轨道 —— 到这里才知道手上是「只有画面」还是「只有声音」；
+3. 只有画面 → 自动抓同页最近 90 秒内请求过的候选地址（最多 3 条），
+   逐个解析，找到「纯音轨且**双方时长都已知**、差 ≤ 0.8 秒」的才合并；
+   时长未知或对不上的候选一律跳过；
+4. 全部落空就交付只有画面的文件，并注明「没有找到时长对得上的音轨」。
+
+**分片流（`.m4s`）怎么处理** —— 抖音有一部分链路走 MSE + fMP4：`moov` 里只有编解码器配置，
+帧数据和样本表都在 `moof` 里。这种文件能完整下载，但 `<video src>` 和多数播放器不认
+（`MEDIA_ERR_SRC_NOT_SUPPORTED`）。插件标成「分片流」，下载后把样本表从 `moof` 搬进 `stbl`，
+转成普通的 moov 前置 MP4 再交付。
+
+如果只下到前面几个分片，`moov` 声明的时长会远大于实际覆盖的时长，转换后会直接报
+「只包含 X 秒（全长 Y 秒）」，而不是给你一个只有几秒的文件 —— 回到播放器把视频完整播一遍再嗅探。
 
 **YouTube 为什么不行** —— 三个互相独立的原因，缺一个都不通：
 
@@ -40,6 +117,16 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 结论：这不是"再多写点代码就能补上"的差距，而是**需要持续跟 YouTube 对抗**。yt-dlp 有专职社区维护，仍然每年被打断几十次。对自用插件来说投入产出比极低。
 
 **如果确实需要 YouTube**：正解是装 `yt-dlp`，让专业工具干专业事。插件这边可以走 native messaging 把地址转给本机 yt-dlp，插件只当 UI —— 这属于本版有意未做的项（见 `RESEARCH.md` 的 P2），需要可以加。
+
+**为什么 0.5.0 移除了 ffmpeg.wasm** —— 三年内它从「主力引擎」降级成了「极少触发的兜底」：
+
+1. 主力路径（TS→MP4 重封装、音视频合并、fMP4 转换）早已全部是纯 JS，不碰 wasm；
+2. 它的兜底场景（HEVC TS 等非常规封装）极少见，且大文件必然 OOM —— 兜不住；
+3. 仓库里背一个 32MB 的 GPL 二进制（`@ffmpeg/core` 是 GPL-2.0-or-later），
+   对 MIT 项目是持续的许可证混染风险，克隆 / 打包也慢。
+
+现在重封装失败（如 HEVC TS）会统一降级成 TS 直出并说明原因：宁可交付一个能播的 TS，
+不给打不开的「MP4」。
 
 ---
 
@@ -57,14 +144,16 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 ## 使用
 
 1. 打开有视频的页面，**点一下播放**（多数播放器要开始播放才会请求分片）
-2. 点扩展图标，popup 会列出嗅探到的资源
-3. 直链：直接点「下载」
+2. 点扩展图标，popup 会列出嗅探到的资源；**正在播放的那条带 ▶ 徽标排在最前**
+3. 直链：直接点「下载」；「仅视频」条目会自动配上时长一致的音轨（也可以手动选）
 4. HLS：先选清晰度与输出格式，再点「下载」
 5. 进度条会实时显示；完成后文件落在 `下载/视频嗅探/<站点>/` 下
 
 按钮含义：
 
 - **重新嗅探** —— 手动触发一次 DOM 扫描
+- **下载（含音频）** —— 两路一起抓，纯 JS 无损合成（配对经过时长校验）
+- **仅视频** —— 只下画面，不带音轨
 - **MP4 合流** —— 自研流式重封装（不重编码，只换容器）。速度取决于磁盘 I/O，**没有体积上限**
 - **TS 直出（快）** —— 只把分片拼起来，秒级完成；有独立音轨时会按段交错保证声画同步。VLC / PotPlayer 可直接播
 
@@ -72,25 +161,39 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 
 ---
 
-## 文件说明
+## 代码结构
 
-| 路径 | 作用 |
-|---|---|
-| `manifest.json` | 清单。注意 `content_security_policy` 里的 `'wasm-unsafe-eval'`，否则 ffmpeg.wasm 起不来 |
-| `background.js` | Service Worker：嗅探归并 + 下载编排 + 消息路由 |
-| `content/hook.js` | **MAIN world** 插桩：包 `fetch` / `XHR` / `MediaSource` / `requestMediaKeySystemAccess` |
-| `content/bridge.js` | ISOLATED world：DOM 扫描 + 桥接页面消息 + 上报后台 |
-| `offscreen.html` / `offscreen.js` | 跑重活的地方：分片下载、AES-128 解密、流式重封装 |
-| `lib/tsdemux.js` | MPEG-TS 解封装：PAT/PMT/PES → H.264 访问单元（AVCC）+ AAC 帧 |
-| `lib/mp4mux.js` | MP4 封装：元数据进 `moov`、样本数据边生成边落盘，内存与文件大小无关 |
-| `lib/segstore.js` | 分片落盘（OPFS）：断点续传的载体，也是「不把整个视频塞进内存」的关键 |
-| `lib/media.js` | 媒体类型识别、格式化工具 |
-| `lib/m3u8.js` | 零依赖 m3u8 解析器（master / media / KEY / MAP / BYTERANGE） |
-| `lib/store.js` | 基于 `chrome.storage.session` 的状态层 |
-| `popup.html` / `popup.css` / `popup.js` | 界面 |
-| `vendor/ffmpeg/` | ffmpeg.wasm（`@ffmpeg/ffmpeg` UMD + `@ffmpeg/core` 单线程版，约 32MB） |
-| `devtest/` | 自动化端到端测试（见下） |
-| `RESEARCH.md` | 立项时的技术方案可行性调研 |
+```
+manifest.json            MV3 清单
+background.js            Service Worker：嗅探归并 + 下载编排 + 消息路由（~700 行）
+content/hook.js          MAIN world 插桩：fetch / XHR / MediaSource / appendBuffer / EME
+content/bridge.js        ISOLATED world：DOM 扫描 + 正在播放判定 + 消息桥接
+offscreen.html/.js       offscreen 入口：任务调度与消息路由（~150 行）
+offscreen/core.js        任务上下文、进度上报、内存预算等公共底座
+offscreen/registry.js    活跃任务 / blob 产物的全局登记表
+jobs/hls.js              HLS 任务：分片下载、AES-128 解密、流式重封装
+jobs/direct.js           直链任务：受限抓取、时长校验配对合并、fMP4 转换
+lib/transport.js         网络层：域名并发限流、可取消 fetch、分片重试、并发池
+lib/outputsink.js        OPFS 输出文件落盘
+lib/segstore.js          分片落盘（OPFS）：断点续传的载体
+lib/tsdemux.js           MPEG-TS 解封装：PAT/PMT/PES → H.264 AVCC + AAC 帧
+lib/mp4mux.js            MP4 封装：元数据进 moov、样本数据边生成边落盘
+lib/mp4remux.js          纯 JS remux：两个 MP4 无损合成、fMP4 → 标准 MP4
+lib/mp4probe.js          从 moov 认轨道构成（仅视频 / 仅音频 / 分片流）与时长
+lib/m3u8.js              零依赖 m3u8 解析器（master / media / KEY / MAP / BYTERANGE）
+lib/referer.js           DNR 会话规则：按任务注入 / 摘除 Referer
+lib/offscreendoc.js      offscreen document 的创建与通信
+lib/naming.js            下载文件命名
+lib/media.js             媒体类型识别、格式化工具
+lib/store.js             chrome.storage.session 状态层
+popup.html/css/js        界面
+devtest/                 自动化端到端测试（见下）
+RESEARCH.md              立项时的技术方案可行性调研
+```
+
+依赖关系自上而下单向：`content/*` 只发消息；`background.js` 编排；
+`jobs/*` 干活；`lib/*` 是无副作用的纯工具（除 `transport` / `outputsink` 天然有 IO）。
+任何一层都可以单独读、单独测。
 
 ---
 
@@ -100,26 +203,36 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 - **MAIN world 注入用 `world: "MAIN"`**，不能用 `<script>` 标签（会被页面 CSP 拦掉）。
 - **`webRequest` 只用来嗅探**。MV3 里它只能观测、不能阻断（阻断仅对企业策略安装的扩展开放），所以这里不承担任何改写职责。
 - **所有状态写 `chrome.storage.session`**。SW 会被随时回收，放内存变量必丢。
-- **长任务全在 offscreen document**。SW 没有 DOM、30 秒空闲即死，跑不了 ffmpeg。
+- **长任务全在 offscreen document**。SW 没有 DOM、30 秒空闲即死，跑不了重活。
 - **同一 tab 的状态写入串行化**（`withTabLock`）。webRequest / 内容脚本 / 播放列表探测会并发触发「读-改-写」，不加锁实测会丢数据。
 - **写锁 + 消息端口**：耗时超过 SW 存活时间的操作不要同步等回执，改成「立刻受理 + 结果另行回传」。
-- **`Referer` 注入用 `declarativeNetRequest` 会话规则**，只在下载任务期间挂上，结束即摘掉。部分 CDN 缺 `Referer` 直接 403。
+- **`Referer` 注入用 `declarativeNetRequest` 会话规则**，按任务隔离（同域名去重、任务结束即摘），只在下载任务期间存在。
+- **`chrome.downloads` 的请求不受 DNR 规则影响**。这是实测出来的：同一条 referer 规则下，扩展内 `fetch` 200、`chrome.downloads.download` 403。所以「需要 Referer 的直链」必须在扩展里 `fetch` 下来再另存。
+- **「正在播放」靠喂流关系判定**，不靠请求时间。见上文「怎么认出正在播放的那个」。
+- **配对靠时长硬校验**。信息流页面的音轨候选鱼龙混杂，时长是唯一低成本的归属证据；合并前再校验一次，界面层拦不住的（手动指定）也拦在交付之前。
 
 ---
 
 ## 已知限制
 
 - **单文件体积**：MP4 合流走流式重封装，`mdat` 边解析边落盘，常驻内存只有每帧十几字节的
-  索引（实测 91MB 素材峰值堆内存 6.4MB），**不再有 900MB 上限**，1.5GB 以上也能直接出 MP4。
-  唯一的硬上限是单个 MP4 不能超过 4GB（32 位 box 长度）。
+  索引（实测 91MB 素材峰值堆内存 6.4MB），**没有 900MB 上限**。唯一的硬上限是单个 MP4
+  不能超过 4GB（32 位 box 长度）。
+- **重封装失败降级 TS**：HEVC / SAMPLE-AES 等非常规 TS 封装无法转 MP4 时，统一降级成
+  TS 直出并说明原因（VLC / PotPlayer 可播）。这是 0.5.0 移除 ffmpeg.wasm 后的行为。
 - **续传的判定依据**：分片目录按「origin + pathname + 非签名参数」算的 key 归档。
   如果站点把视频 ID 塞在签名参数里（每次点开都变），就认不出是同一个视频，会重新下载。
 - **`SameSite` Cookie**：offscreen 的请求是跨站发起的，`SameSite=Lax/Strict` 的 Cookie 不会带上。签名 URL（token 在 query 里）不受影响；纯靠 Cookie 鉴权的分片可能 403。
 - **加密格式**：只支持 `AES-128`（key 在 m3u8 里）。`SAMPLE-AES` 属于 DRM 范畴，不支持。
 - **`EXT-X-BYTERANGE`** 支持 Range 请求；服务端不支持 Range 时会失败。
-- **MP4 合流的适用面**：只处理 H.264 + AAC 的 TS 分片（含分离音轨）。遇到 HEVC、SAMPLE-AES 等
-  非常规封装时，小文件会回退 ffmpeg.wasm 兜底，大文件则给 TS 直出并说明原因。
 - **C 档站点**：YouTube 有 signature 混淆 + PoToken、B 站有 WBI 签名，URL 抓下来直接请求会 403。本插件是「实时捕获」而非事后构造，能缓解但仍拿不到可用文件 —— 具体原因见上文「常见站点会怎样」。
+- **受限直链的代价**：走「抓取另存」的下载不再支持断点续传，且中途失败要整段重来（普通直链不受影响）。
+- **音轨合并**：纯 JS remux，只搬容器不改编码，理论上限是 4GB（32 位 `stco`）。若两段编码不兼容
+  （例如视频 HEVC、音频 Opus），合成出的文件播放器可能不支持 —— 这不是 remux 的问题，源本身就没法那样组合。
+- **轨道识别的前提**：靠读文件头部的 `moov`，对「`moov` 在前」（fMP4 / faststart）的文件一次 64KB
+  请求就够；`moov` 在尾部时只探到「未知」，此时按普通直链下载、不做配对（下载本身不受影响）。
+- **分片流只含已缓存的部分**：转换建立在「这条 URL 返回的字节」上。如果播放器只请求了前半段，
+  产物就只有前半段（会明确报出来）。想要完整视频，先在播放器里完整播一遍。
 
 ---
 
@@ -131,8 +244,13 @@ Chrome 扩展（Manifest V3）。打开任意页面自动识别其中的视频�
 node devtest/run.mjs
 ```
 
-覆盖 18 项断言：SW 启动无异常、MAIN world 插桩注入、三路检测各自命中、
-master 清晰度解析、HLS 全链路（含 AES-128 解密 + 独立音轨合入）、ffmpeg.wasm 引擎可用性。
+覆盖 40+ 项断言：SW 启动无异常、MAIN world 插桩注入、三路检测各自命中、
+master 清晰度解析、HLS 全链路（含 AES-128 解密 + 独立音轨合入）、
+Referer 白名单直链（服务端真返回 403，只有下载请求带上 Referer 才能落盘）、
+轨道识别与「下载（含音频）」配对入口、**正在播放标记（模拟 MSE 喂流关系）**、
+分片流转标准 MP4（产物必须能解析出 moov 且不再是 fragmented）、截断下载判定失败且不落盘、
+**DASH 自动配对按时长硬校验（时长不符的候选必须被跳过）**、
+**显式配对时长不符必须在合并前失败且不落盘**、临时规则清理。
 
 依赖 `puppeteer-core`（不下载 Chromium，直接用本机已装的 Chrome）。在 `devtest/` 里装即可：
 
@@ -145,43 +263,41 @@ node run.mjs
 
 ```bash
 VD_NODE_MODULES=/path/to/node_modules node devtest/run.mjs
-VD_CHROME="/path/to/chrome.exe" node devtest/run.mjs
+VD_CHROME="/path/to/chrome" node devtest/run.mjs
+# 受限环境（容器 / CI）里 Chrome 沙箱起不来时：
+VD_CHROME_ARGS="--no-sandbox --disable-gpu" node devtest/run.mjs
 ```
 
 ### 踩过的坑（改测试时务必注意）
 
-1. **Chrome 137+ 已禁止 `--load-extension` 命令行装载扩展**。必须改用 CDP 的 `Extensions.loadUnpacked`，
-   并且启动参数要带 `--enable-unsafe-extension-debugging` + `pipe: true`。
-2. **puppeteer 默认会注入 `--disable-extensions`**，必须用 `ignoreDefaultArgs: ['--disable-extensions']` 摘掉，
-   否则扩展装了但完全不工作。
-3. **必须清空 user-data-dir**（脚本里已经做了）。不清的话 Chrome 会复用上次装进去的扩展代码，
-   导致「源码改了但测的是旧版本」，现象很迷惑：老消息类型能回、新加的不行。
-4. **Service Worker 给自己发消息收不到回执** (`chrome.runtime.sendMessage` 不会派发给发送者自己)，
-   测试要从 popup 页面发。
-5. **CDP 的 `Browser.setDownloadBehavior` 会把落盘文件名改成 GUID**，所以断言要看产物大小，
-   文件名断言用 job 记录里的 `filename`。
+1. **Chrome 137+ 已禁止 `--load-extension` 命令行装载扩展**。必须改用 CDP 的 `Extensions.loadUnpacked`，并且启动参数要带 `--enable-unsafe-extension-debugging` + `pipe: true`。
+2. **puppeteer 默认会注入 `--disable-extensions`**，必须用 `ignoreDefaultArgs: ['--disable-extensions']` 摘掉，否则扩展装了但完全不工作。
+3. **必须清空 user-data-dir**（脚本里已经做了）。不清的话 Chrome 会复用上次装进去的扩展代码，导致「源码改了但测的是旧版本」，现象很迷惑：老消息类型能回、新加的不行。
+4. **Service Worker 给自己发消息收不到回执** (`chrome.runtime.sendMessage` 不会派发给发送者自己)，测试要从 popup 页面发。
+5. **CDP 的 `Browser.setDownloadBehavior` 会把落盘文件名改成 GUID**，所以断言要看产物大小，文件名断言用 job 记录里的 `filename`。
 
 ---
 
 ## 常见问题
 
-- **列表是空的**：先点一下播放。部分站点用 Service Worker 代理媒体请求，`webRequest` 可能看不到，
-  这类站点目前需要手填 URL（后续可接 `chrome.debugger` 深度模式）。
-- **HLS 下出来没有声音**：说明该 master 用 `EXT-X-MEDIA` 分离了音轨。正常情况下插件会自动带上音频轨道；
-  如果音频是加密的 `SAMPLE-AES`，会明确报错。
-- **下载到一半失败**：已下载的分片会留在浏览器私有存储里，**同一个视频再点一次下载就会从断点继续**，
-  不会从头再来。错误文案会区分「请求失败 4xx」「分片解密失败」「转封装失败」，并说明分片是否已保留。
-  单个分片本身失败会自动重试 4 次，多数网络抖动扛得过去。
-- **`视频嗅探` 目录下文件名很长**：命名规则是 `<页面标题>-<id>`，可在 `background.js` 的
-  `buildFilename` / `offscreen.js` 的 `buildFilename` 里调整。
+- **列表是空的**：先点一下播放。部分站点用 Service Worker 代理媒体请求，`webRequest` 可能看不到，这类站点目前需要手填 URL（后续可接 `chrome.debugger` 深度模式）。
+- **下载到了别的视频**：0.5.0 起列表按「正在播放」置顶（▶ 徽标），且音轨配对 / 合并都有时长硬校验。如果还遇到，请带上页面类型提 issue。
+- **HLS 下出来没有声音**：说明该 master 用 `EXT-X-MEDIA` 分离了音轨。正常情况下插件会自动带上音频轨道；如果音频是加密的 `SAMPLE-AES`，会明确报错。
+- **下载到一半失败**：已下载的分片会留在浏览器私有存储里，**同一个视频再点一次下载就会从断点继续**，不会从头再来。错误文案会区分「请求失败 4xx」「分片解密失败」「转封装失败」，并说明分片是否已保留。单个分片本身失败会自动重试 4 次，多数网络抖动扛得过去。
+- **抖音下载报「请求被拒绝（HTTP 403）」**：签名 URL 有时效（通常几小时），过期后 CDN 直接 403。回到页面重新播放一下、重新嗅探再下即可。另外 Referer 取的是页面地址，必须先在 `douyin.com` 的视频页里操作，不能把地址单独拷到新标签页里下。
+- **报「音轨时长对不上」**：你手动指定的音轨和视频不是同一条内容的（时长差超过 0.8s）。在列表里选时长一致的音频条目；时长未知时先在播放器里播完整再嗅探，让插件拿到时长。
+- **下出来只有画面没声音**：说明这个页面把音视频拆成两个文件下发，而你只下了「仅视频」那条。重新点「下载（含音频）」；或者用播放器/ffmpeg 把两条合起来（`ffmpeg -i v.mp4 -i a.mp4 -c copy -map 0:v -map 1:a out.mp4`）。
+- **`视频嗅探` 目录下文件名很长**：命名规则是 `<页面标题>-<id>`，统一在 `lib/naming.js` 里调整。
+
+---
+
+## 贡献
+
+见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ---
 
 ## 许可
 
-本项目自有代码采用 **MIT** 许可证，见 [`LICENSE`](LICENSE)。
-
-`vendor/ffmpeg/` 为第三方预构建产物，**不适用 MIT**：其中
-`@ffmpeg/ffmpeg`（MIT）与 `@ffmpeg/core`（**GPL-2.0-or-later**）来自
-[ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm) 项目，版权归原作者所有。
-再分发前请阅读 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+本项目采用 **MIT** 许可证，见 [`LICENSE`](LICENSE)。0.5.0 起不再内置任何第三方二进制
+（ffmpeg.wasm 已移除），仓库内全部为自有代码。
