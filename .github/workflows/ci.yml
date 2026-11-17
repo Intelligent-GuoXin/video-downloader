@@ -19,12 +19,24 @@ jobs:
         with:
           node-version: 22
 
-      - name: 安装 Chrome 稳定版
+      # runner 镜像预装了 Google Chrome 稳定版，直接定位复用；
+      # 真缺失时才走 apt 安装（gpg 必须加 --batch --yes，
+      # 否则 CI 里没有 /dev/tty 会直接失败）。
+      - name: 定位 Chrome（优先复用 runner 预装）
         run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -q
-          sudo apt-get install -y -q google-chrome-stable
+          CHROME_BIN="$(command -v google-chrome-stable || command -v google-chrome || true)"
+          if [ -z "$CHROME_BIN" ]; then
+            echo "runner 未预装 Chrome，走 apt 安装"
+            wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+              | sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/google-chrome.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+              | sudo tee /etc/apt/sources.list.d/google-chrome.list
+            sudo apt-get update -q
+            sudo apt-get install -y -q google-chrome-stable
+            CHROME_BIN="$(command -v google-chrome-stable)"
+          fi
+          echo "使用 Chrome: $CHROME_BIN ($("$CHROME_BIN" --version))"
+          echo "VD_CHROME=$CHROME_BIN" >> "$GITHUB_ENV"
 
       - name: 安装测试依赖
         working-directory: devtest
@@ -38,6 +50,5 @@ jobs:
 
       - name: 端到端测试
         env:
-          VD_CHROME: /usr/bin/google-chrome-stable
           VD_CHROME_ARGS: --no-sandbox --disable-gpu
         run: node devtest/run.mjs
